@@ -1,0 +1,241 @@
+"""
+train_and_evaluate_emotion_cnn.py
+
+Usage:
+- Update DATA_DIR to the folder containing 'train/' and 'test/' subfolders.
+- Run: python train_and_evaluate_emotion_cnn.py
+"""
+
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.metrics import classification_report, confusion_matrix
+import itertools
+import json
+
+# TensorFlow / Keras
+import tensorflow as tf
+from tensorflow.keras import layers, models
+from tensorflow.keras.layers import Conv2D, MaxPooling2D, Dropout, Flatten, Dense, BatchNormalization, Activation
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau
+
+# ----------------------------
+# CONFIG
+# ----------------------------
+DATA_DIR = r"D:\Final PROJECT\malware_csvs"   # <-- CHANGE this to your data root
+# DATA_DIR must contain 'train' and 'test' directories
+TRAIN_DIR = os.path.join(DATA_DIR, "train")
+TEST_DIR = os.path.join(DATA_DIR, "test")
+
+IMG_ROWS, IMG_COLS = 48, 48
+BATCH_SIZE = 64
+EPOCHS = 30
+NUM_CLASSES = 7  # Angry, Disgust, Fear, Happy, Neutral, Sad, Surprise
+
+OUTPUT_MODEL_JSON = os.path.join(DATA_DIR, "models.json")
+OUTPUT_WEIGHTS = os.path.join(DATA_DIR, "model.h5")
+
+# ----------------------------
+# UTIL: plot confusion matrix
+# ----------------------------
+def plot_confusion_matrix(cm, classes,
+                          normalize=False,
+                          title='Confusion matrix',
+                          cmap=plt.cm.Blues):
+    """
+    This function prints and plots the confusion matrix.
+    """
+    if normalize:
+        cm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+        print("Normalized confusion matrix")
+    else:
+        print('Confusion matrix, without normalization')
+
+    print(cm)
+
+    plt.figure(figsize=(8,6))
+    plt.imshow(cm, interpolation='nearest', cmap=cmap)
+    plt.title(title)
+    plt.colorbar()
+    tick_marks = np.arange(len(classes))
+    plt.xticks(tick_marks, classes, rotation=45)
+    plt.yticks(tick_marks, classes)
+
+    thresh = cm.max() / 2.0
+    for i, j in itertools.product(range(cm.shape[0]), range(cm.shape[1])):
+        val = cm[i, j]
+        if normalize:
+            fmt = "{:.2f}".format(val)
+        else:
+            fmt = "{:d}".format(int(val))
+        plt.text(j, i, fmt,
+                 horizontalalignment="center",
+                 color="white" if cm[i, j] > thresh else "black")
+
+    plt.tight_layout()
+    plt.ylabel('True label')
+    plt.xlabel('Predicted label')
+    plt.show()
+
+
+# ----------------------------
+# Build CNN model
+# ----------------------------
+def build_model(input_shape=(IMG_ROWS, IMG_COLS, 1), num_classes=NUM_CLASSES):
+    model = models.Sequential()
+
+    model.add(Conv2D(32, (3, 3), padding='same', kernel_initializer='he_normal', input_shape=input_shape))
+    model.add(Activation('relu'))
+    model.add(BatchNormalization())
+    model.add(Conv2D(32, (3, 3), padding='same', kernel_initializer='he_normal'))
+    model.add(Activation('relu'))
+    model.add(BatchNormalization())
+    model.add(MaxPooling2D(pool_size=(2, 2)))
+    model.add(Dropout(0.2))
+
+    model.add(Conv2D(64, (3, 3), padding='same', kernel_initializer='he_normal'))
+    model.add(Activation('relu'))
+    model.add(BatchNormalization())
+    model.add(Conv2D(64, (3, 3), padding='same', kernel_initializer='he_normal'))
+    model.add(Activation('relu'))
+    model.add(BatchNormalization())
+    model.add(MaxPooling2D(pool_size=(2, 2)))
+    model.add(Dropout(0.25))
+
+    model.add(Conv2D(128, (3, 3), padding='same', kernel_initializer='he_normal'))
+    model.add(Activation('relu'))
+    model.add(BatchNormalization())
+    model.add(Conv2D(128, (3, 3), padding='same', kernel_initializer='he_normal'))
+    model.add(Activation('relu'))
+    model.add(BatchNormalization())
+    model.add(MaxPooling2D(pool_size=(2, 2)))
+    model.add(Dropout(0.25))
+
+    model.add(Flatten())
+    model.add(Dense(1024, kernel_initializer='he_normal'))
+    model.add(Activation('relu'))
+    model.add(BatchNormalization())
+    model.add(Dropout(0.5))
+
+    model.add(Dense(num_classes, activation='softmax'))
+
+    opt = tf.keras.optimizers.Adam(learning_rate=0.0005)
+    model.compile(optimizer=opt, loss='categorical_crossentropy', metrics=['accuracy'])
+    return model
+
+
+# ----------------------------
+# Data generators
+# ----------------------------
+def make_generators(train_dir, test_dir, batch_size=BATCH_SIZE, target_size=(IMG_ROWS, IMG_COLS)):
+    # Train augmentation
+    train_datagen = ImageDataGenerator(
+        rescale=1./255,
+        rotation_range=10,
+        width_shift_range=0.1,
+        height_shift_range=0.1,
+        shear_range=0.1,
+        zoom_range=0.1,
+        horizontal_flip=True,
+        fill_mode='nearest'
+    )
+
+    test_datagen = ImageDataGenerator(rescale=1./255)
+
+    train_gen = train_datagen.flow_from_directory(
+        train_dir,
+        color_mode='grayscale',
+        target_size=target_size,
+        batch_size=batch_size,
+        class_mode='categorical',
+        shuffle=True
+    )
+
+    test_gen = test_datagen.flow_from_directory(
+        test_dir,
+        color_mode='grayscale',
+        target_size=target_size,
+        batch_size=batch_size,
+        class_mode='categorical',
+        shuffle=False
+    )
+
+    return train_gen, test_gen
+
+
+# ----------------------------
+# TRAIN / EVALUATE pipeline
+# ----------------------------
+def train_and_evaluate():
+    # checks
+    if not os.path.isdir(TRAIN_DIR) or not os.path.isdir(TEST_DIR):
+        raise FileNotFoundError(f"Make sure TRAIN_DIR ({TRAIN_DIR}) and TEST_DIR ({TEST_DIR}) exist.")
+
+    train_gen, test_gen = make_generators(TRAIN_DIR, TEST_DIR)
+
+    print("Classes found (train):", train_gen.class_indices)
+
+    model = build_model(input_shape=(IMG_ROWS, IMG_COLS, 1), num_classes=len(train_gen.class_indices))
+    model.summary()
+
+    # callbacks
+    callbacks = [
+        ModelCheckpoint(OUTPUT_WEIGHTS, monitor='val_accuracy', save_best_only=True, verbose=1),
+        EarlyStopping(monitor='val_accuracy', patience=6, restore_best_weights=True, verbose=1),
+        ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, verbose=1)
+    ]
+
+    steps_per_epoch = max(1, train_gen.samples // BATCH_SIZE)
+    validation_steps = max(1, test_gen.samples // BATCH_SIZE)
+
+    history = model.fit(
+        train_gen,
+        steps_per_epoch=steps_per_epoch,
+        epochs=EPOCHS,
+        validation_data=test_gen,
+        validation_steps=validation_steps,
+        callbacks=callbacks
+    )
+
+    # Save model architecture
+    model_json = model.to_json()
+    with open(OUTPUT_MODEL_JSON, "w") as json_file:
+        json_file.write(model_json)
+    print(f"Saved model architecture to: {OUTPUT_MODEL_JSON}")
+
+    # Save best weights already saved by ModelCheckpoint to OUTPUT_WEIGHTS
+    print(f"Model weights saved to: {OUTPUT_WEIGHTS}")
+
+    # Evaluate on test set (full)
+    # Predict labels on whole test set
+    test_gen.reset()
+    preds = model.predict(test_gen, steps=(test_gen.samples // BATCH_SIZE) + 1, verbose=1)
+    y_pred = np.argmax(preds, axis=1)
+    y_true = test_gen.classes  # ground truth indices in folder order
+
+    # Map indices to class labels
+    idx_to_class = {v: k for k, v in test_gen.class_indices.items()}
+    y_true_labels = [idx_to_class[i] for i in y_true]
+    y_pred_labels = [idx_to_class[i] for i in y_pred]
+
+    # Classification report
+    print("\nClassification Report:")
+    print(classification_report(y_true_labels, y_pred_labels, digits=4))
+
+    # Confusion matrix
+    cm = confusion_matrix(y_true_labels, y_pred_labels, labels=list(test_gen.class_indices.keys()))
+    plot_confusion_matrix(cm, classes=list(test_gen.class_indices.keys()), normalize=False,
+                          title="Confusion matrix")
+
+    # Also return history and model for further use
+    return model, history
+
+
+# ----------------------------
+# Run
+# ----------------------------
+if __name__ == "__main__":
+    # make sure output dir exists
+    os.makedirs(DATA_DIR, exist_ok=True)
+    model, history = train_and_evaluate()
